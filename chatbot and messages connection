@@ -1,0 +1,135 @@
+// === CONFIGURATION ===
+// FastAPI base URL (change to your public URL in production)
+define('BVCITS_API_BASE', 'http://127.0.0.1:8000');
+
+// Must match BACKEND_JWT_SECRET in FastAPI .env
+define('BVCITS_BACKEND_SECRET', 'replace_with_same_secret_as_backend');
+
+// === JWT CREATION ===
+function bvcits_base64url($data) {
+    return rtrim(strtr(base64_encode($data), '+/', '-_'), '=');
+}
+
+function bvcits_jwt_for_user($user_id, $site_id) {
+    $header = ['alg' => 'HS256', 'typ' => 'JWT'];
+    $now = time();
+    $payload = [
+        'user_id' => (int) $user_id,
+        'site_id' => (int) $site_id,
+        'iat'     => $now,
+        'exp'     => $now + 300 // 5 minutes expiry
+    ];
+    $segments = [
+        bvcits_base64url(json_encode($header)),
+        bvcits_base64url(json_encode($payload))
+    ];
+    $signing_input = implode('.', $segments);
+    $signature     = hash_hmac('sha256', $signing_input, BVCITS_BACKEND_SECRET, true);
+    $segments[]    = bvcits_base64url($signature);
+    return implode('.', $segments);
+}
+
+// === HTTP POST TO BACKEND /ingest ===
+function bvcits_post_ingest($payload) {
+    $jwt = bvcits_jwt_for_user($payload['user_id_owner'], get_current_blog_id());
+
+    $response = wp_remote_post(BVCITS_API_BASE . '/ingest', [
+        'headers' => [
+            'Authorization' => 'Bearer ' . $jwt,
+            'Content-Type'   => 'application/json'
+        ],
+        'body'    => wp_json_encode($payload),
+        'timeout' => 10
+    ]);
+
+    if (is_wp_error($response)) {
+        error_log('Chatbot ingest error: ' . $response->get_error_message());
+    }
+}
+
+// === HOOK: DIRECT MESSAGES SENT ===
+add_action( 'messages_message_sent', function( $message, $recipients ) {
+    $current_user = get_current_user_id();
+
+    // Outbound from sender
+    $payload = [
+        'site_id'          => get_current_blog_id(),
+        'user_id_owner'    => $current_user,
+        'visibility_scope' => 'dm',
+        'group_id'         => null,
+        'other_user_id'    => (int) ( $recipients[0] ?? 0 ),
+        'direction'        => 'outbound',
+        'content'          => $message->message,
+        'created_at'       => current_time( 'mysql', true ),
+        'message_hash'     => md5( $message->message )
+    ];
+    bvcits_post_ingest( $payload );
+
+    // Inbound copy for recipients
+    if ( ! empty( $recipients ) ) {
+        foreach ( $recipients as $recipient_id ) {
+            if ( (int) $recipient_id === $current_user ) continue;
+            $payload['user_id_owner'] = (int) $recipient_id;
+            $payload['direction']     = 'inbound';
+            bvcits_post_ingest( $payload );
+        }
+    }
+}, 10, 2 );
+
+
+// === HOOK: GROUP POSTS ===
+add_action('bp_groups_posted_update', function($content, $user_id, $group_id) {
+    // Outbound for poster
+    $payload = [
+        'site_id'         => get_current_blog_id(),
+        'user_id_owner'   => (int) $user_id,
+        'visibility_scope'=> 'group',
+        'group_id'        => (int) $group_id,
+        'other_user_id'   => null,
+        'direction'       => 'outbound',
+        'content'         => $content,
+        'created_at'      => current_time('mysql', true),
+        'message_hash'    => md5($content)
+    ];
+    bvcits_post_ingest($payload);
+
+    // Inbound for all other group members
+    if (function_exists('groups_get_group_members')) {
+        $members = groups_get_group_members(['group_id' => $group_id]);
+        if (!empty($members['members'])) {
+            foreach ($members['members'] as $member) {
+                if ((int) $member->ID === (int) $user_id) continue;
+                $payload['user_id_owner'] = (int) $member->ID;
+                $payload['direction']     = 'inbound';
+                bvcits_post_ingest($payload);
+            }
+        }
+    }
+}, 10, 3);
+
+// === HOOK: GROUP MEMBERSHIP CHANGES ===
+add_action('groups_join_group', function($group_id, $user_id) {
+    global $wpdb;
+    $wpdb->replace(
+        'chatbot_group_memberships', // direct table name without wp_ prefix
+        [
+            'site_id'   => get_current_blog_id(),
+            'user_id'   => (int) $user_id,
+            'group_id'  => (int) $group_id,
+            'role'      => 'member',
+            'joined_at' => current_time('mysql', true)
+        ]
+    );
+}, 10, 2);
+
+add_action('groups_leave_group', function($group_id, $user_id) {
+    global $wpdb;
+    $wpdb->delete(
+        'chatbot_group_memberships', // direct table name without wp_ prefix
+        [
+            'site_id'  => get_current_blog_id(),
+            'user_id'  => (int) $user_id,
+            'group_id' => (int) $group_id
+        ]
+    );
+}, 10, 2);
