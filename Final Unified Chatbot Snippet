@@ -1,0 +1,136 @@
+// === BuddyPress Chatbot Nav Tab ===
+add_action('bp_setup_nav', function () {
+    bp_core_new_nav_item([
+        'name' => 'Chatbot',
+        'slug' => 'chatbot',
+        'screen_function' => 'bvcits_chatbot_screen',
+        'position' => 25,
+        'show_for_displayed_user' => true,
+        'default_subnav_slug' => 'chatbot',
+    ]);
+});
+
+function bvcits_chatbot_screen() {
+    add_action('bp_template_content', 'bvcits_render_chatbot_ui');
+    bp_core_load_template('members/single/plugins');
+}
+
+// === Per-User Table Creation + Daily Greeting ===
+add_action('bp_init', function () {
+    if (!is_user_logged_in()) return;
+    global $wpdb;
+    $user_id = get_current_user_id();
+    $table_name = $wpdb->prefix . 'chatbot_messages_user_' . intval($user_id);
+
+    if ($wpdb->get_var($wpdb->prepare("SHOW TABLES LIKE %s", $table_name)) !== $table_name) {
+        require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+        $charset_collate = $wpdb->get_charset_collate();
+        $sql = "CREATE TABLE `$table_name` (
+            id BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT,
+            message TEXT NOT NULL,
+            role VARCHAR(50) NOT NULL,
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (id)
+        ) $charset_collate;";
+        dbDelta($sql);
+    }
+
+    $last_sent_date = get_user_meta($user_id, '_chatbot_last_sent_date', true);
+    $today_date = current_time('Y-m-d');
+    if ($last_sent_date !== $today_date) {
+        messages_new_message([
+            'sender_id'  => 123, // Change to your bot/system user ID
+            'subject'    => 'Chatbot',
+            'content'    => 'Hi, I’m your assistant. Ask me anything, or request message summaries.',
+            'recipients' => [$user_id],
+        ]);
+        update_user_meta($user_id, '_chatbot_last_sent_date', $today_date);
+    }
+});
+
+// === Chat UI with Friendly Fallback JS + Enter Key Send ===
+function bvcits_render_chatbot_ui() {
+    $current_user_id = get_current_user_id(); // Pass to JS
+    ?>
+    <style>
+        #bvcits-chat-window {
+            border: 1px solid #ddd;
+            padding: 15px;
+            height: 500px;
+            overflow-y: auto;
+            background: #fafafa;
+        }
+        .user-msg {
+            margin: 8px 0;
+            text-align: right;
+            background: #DCF8C6;
+            display: inline-block;
+            padding: 8px 12px;
+            border-radius: 8px;
+        }
+        .bot-msg {
+            margin: 8px 0;
+            text-align: left;
+            background: #fff;
+            display: inline-block;
+            padding: 8px 12px;
+            border-radius: 8px;
+        }
+    </style>
+
+    <div id="bvcits-chatbot-container" style="max-width:800px;margin:auto;">
+        <div id="bvcits-chat-window">
+            <div class="bot-msg">Hi — Ask me general questions, or request summaries of your messages.</div>
+        </div>
+        <div style="margin-top:10px;display:flex;">
+            <input id="bvcits-chat-input" type="text" placeholder="Type here..." style="flex:1;padding:8px;border:1px solid #ccc;">
+            <button id="bvcits-chat-send" style="padding:8px 15px;background:#0073aa;color:#fff;border:none;">Send</button>
+        </div>
+    </div>
+
+    <script>
+        const BVCITS_USER_ID = <?php echo (int) $current_user_id; ?>;
+
+        async function sendChatMessage() {
+            let input = document.getElementById('bvcits-chat-input');
+            let msg = input.value.trim();
+            if (!msg) return;
+            let win = document.getElementById('bvcits-chat-window');
+            win.innerHTML += `<div class="user-msg">${msg}</div>`;
+            input.value = '';
+            try {
+                let res = await fetch('http://127.0.0.1:8000/chat', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-User-ID': BVCITS_USER_ID // send user ID in header
+                    },
+                    body: JSON.stringify({ message: msg })
+                });
+                let data = await res.json();
+                let botReply = data.reply || "No reply received";
+               // Simple URL-to-link converter
+let linkedReply = botReply.replace(
+    /(https?:\/\/[^\s]+)/g,
+    '<a href="$1" target="_blank" rel="noopener noreferrer">$1</a>'
+);
+win.innerHTML += `<div class="bot-msg">${linkedReply}</div>`;
+
+
+            } catch (e) {
+               win.innerHTML += `<div class="bot-msg">Error: ${e.message}</div>`;
+console.error("Chatbot error:", e);
+
+            }
+            win.scrollTop = win.scrollHeight;
+        }
+
+        document.getElementById('bvcits-chat-send').addEventListener('click', sendChatMessage);
+        document.getElementById('bvcits-chat-input').addEventListener('keydown', function (e) {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                sendChatMessage();
+            }
+        });
+    </script>
+<?php }
